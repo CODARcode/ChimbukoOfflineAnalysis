@@ -182,4 +182,16 @@ class ProvenanceDatabase:
         s = self(Query.from_(rt).select( ( (rt.entry - start)/1e6 ).as_("entry_s") , ( (rt.exit - start)/1e6 ).as_("exit_s"),  ( (rt.timestamp - start)/1e6 ).as_("state_timestamp_s"), rt.star    )).to_view("s")
         return self('SELECT "pid", "rid", "hostname", "state_timestamp_s", "entry_s", "exit_s", "meminfo:MemFree (MB)" AS "free_MB",  "meminfo:MemTotal (MB)" AS "total_MB", "Memory Footprint (VmRSS) (KB)" AS "RSS_KB", "Heap Memory Used (KB)" AS "heap_memory_used_KB" FROM "s"')
 
-
+    #Produce a table for a specific process pid containing:
+    #- the call stack label
+    #- a count of anomalies with that call stack
+    #- the average severity for those anomalies
+    #- the function name and a corresponding hash
+    #
+    #The output is sorted according to the average severity in descending order
+    def getCallStackSummaries(self, pid):
+        d = self.anomalies
+        cl = self.call_stack_labels
+        f = self.functions
+        self(Query.from_(d).select(d.outlier_severity, cl.call_stack_label, f.name).where(d.pid==0).inner_join(cl).on(d.event_id == cl.event_id).inner_join(f).on(d.fid == f.fid) ).to_view("r")
+        return self("SELECT call_stack_label, count(*) as anomaly_count, AVG(outlier_severity) as avg_severity, first(name) as fname, hash(first(name)) as fname_hash, FROM r GROUP BY call_stack_label ORDER BY avg_severity DESC")
