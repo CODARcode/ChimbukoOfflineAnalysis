@@ -164,6 +164,19 @@ class ProvenanceDatabase:
         return self(Query.from_(d).select(d.io_step_tstart)
             .where( (d.pid == pid) & (d.rid == rank) & (d.io_step) == 0 ) ).fetchnumpy()['io_step_tstart'][0]
 
+    #Convert unix time column "col_name_in" to a new column "col_name_out" given as seconds since the start of the run
+    #The table must contain a "pid" and "rid" column
+    def convertColumnToSecondsSinceStart(self, table: Table, col_name_in, col_name_out):
+        if isinstance(table, Table):
+            tab_nm = table.get_sql()
+        elif isinstance(table, str):
+            tab_nm = table
+        else:
+            assert 0
+        io_steps_tab = self.io_steps.get_sql()
+        
+        return self("FROM %s SELECT *, (%s - (FROM %s SELECT FIRST(io_step_tstart) WHERE pid = %s.pid AND rid = %s.rid AND io_step = 0))/1e6 AS %s" % (tab_nm,col_name_in,io_steps_tab,tab_nm,tab_nm, col_name_out ) )
+    
     #Return the primary table (anomalies / normal_execs) for the specific event
     def getEventPrimaryTable(self, event_id):
         d=self.anomalies
