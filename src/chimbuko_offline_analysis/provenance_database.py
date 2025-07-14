@@ -3,19 +3,16 @@ import pypika
 from pypika import *
 import numpy
 
-class ProvenanceDatabase:
+class ProvenanceDatabaseConnection:
     def __init__(self):
-        self.con = duckdb.connect()        
+        self.con = duckdb.connect()
+        self.db = []
     def connect(self, file : str):
-        #self.con = duckdb.connect(database = file, read_only = True)
-        self.con.sql("ATTACH '%s' AS pdb (READ_ONLY)" % file)
-
-        #auto-generate the table objects
-        self.pdb = Database("pdb")
-        print("Tables:")
-        for n in self.con.sql("SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE'").fetchnumpy()["table_name"]:
-            exec("self.%s = Table(\"%s\", self.pdb)" % (n,n))
-            print(n)
+        ndb = len(self.db)
+        db_nm = "pdb_%d" % ndb
+        self.con.sql("ATTACH '%s' AS %s (READ_ONLY)" % (file,db_nm))
+        self.db.append(ProvenanceDatabase(self, db_nm))
+        return self.db[-1]
         
     def __call__(self, query : pypika.queries.QueryBuilder) -> duckdb.duckdb.DuckDBPyRelation:
         if type(query) == pypika.queries.QueryBuilder:
@@ -26,18 +23,34 @@ class ProvenanceDatabase:
             return self.con.sql(query)    
         else:
             raise Exception("Invalid input type")
+
+class ProvenanceDatabase:
+    def __init__(self, pdb_con, db_nm):
+        #auto-generate the table objects
+        self.db_nm = db_nm
+        self.pdb = Database(db_nm)
+        self.pdb_con = pdb_con
+        print("Tables:")
+        for n in pdb_con("SELECT DISTINCT table_name FROM information_schema.tables WHERE table_type='BASE TABLE'").fetchnumpy()["table_name"]:
+            exec("self.%s = Table(\"%s\", self.pdb)" % (n,n))
+            print(n)        
+
+    def __call__(self, query : pypika.queries.QueryBuilder) -> duckdb.duckdb.DuckDBPyRelation:
+        return self.pdb_con(query)
+
     def describe(self, table : str):
-        q = "DESCRIBE " + table
+        q = ("DESCRIBE %s." % self.db_nm) + table
         return self.__call__(q)
     def listTables(self):        
-        return self("SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE'")
+        return self("SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_catalog='%s'" % self.db_nm)
     def listColumns(self, table : Table):
-        return self("SELECT COLUMN_NAME FROM duckdb_columns() WHERE TABLE_NAME = '%s'" % table.get_table_name() )
+        return self("SELECT COLUMN_NAME FROM duckdb_columns() WHERE TABLE_NAME = '%s' AND database_name='%s'" % (table.get_table_name(),self.db_nm) )
     def listColumnsAsArray(self, table: Table):
         return self.listColumns(table).fetchnumpy()["column_name"]
 
     def getFunctionName(self, fid):
-        return self(Query.from_(self.functions).select(self.functions.name).where(self.functions.fid == fid) ).fetchnumpy()["name"][0]
+        f = self.functions
+        return self(Query.from_(f).select(f.name).where(f.fid == fid) ).fetchnumpy()["name"][0]
 
     #Get the number of anomalies recorded for the given function idx    
     def getFunctionAnomalyCount(self, fid):
@@ -74,8 +87,10 @@ class ProvenanceDatabase:
         return times
     
     def getEventExecWindow(self, event_id : str):
-        return self(Query.from_(self.exec_windows).select(self.exec_window_events.star).where(self.exec_windows.event_id == event_id )
-            .inner_join(self.exec_window_events).on( self.exec_windows.exec_window_entry_id == self.exec_window_events.event_id ) )
+        ew = self.exec_windows
+        ewe = self.exec_window_events
+        return self(Query.from_(ew).select(ewe.star).where(ew.event_id == event_id )
+            .inner_join(ewe).on( ew.exec_window_entry_id == ewe.event_id ) )
 
     def getEventCallStack(self, event_id : str):
         cs = self.call_stacks
@@ -195,3 +210,6 @@ class ProvenanceDatabase:
         f = self.functions
         self(Query.from_(d).select(d.outlier_severity, cl.call_stack_label, f.name).where(d.pid==0).inner_join(cl).on(d.event_id == cl.event_id).inner_join(f).on(d.fid == f.fid) ).to_view("r")
         return self("SELECT call_stack_label, count(*) as anomaly_count, AVG(outlier_severity) as avg_severity, first(name) as fname, hash(first(name)) as fname_hash, FROM r GROUP BY call_stack_label ORDER BY avg_severity DESC")
+    
+            
+

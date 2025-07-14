@@ -8,4 +8,5 @@ dependencies = [
   "duckdb",
   "pypika",
   "numpy",
+  "plotly"
 ]
