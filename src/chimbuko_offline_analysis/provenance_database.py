@@ -1,6 +1,7 @@
 import duckdb
 import pypika
 from pypika import *
+from pypika import functions as fn
 import numpy
 
 class ProvenanceDatabaseConnection:
@@ -89,8 +90,11 @@ class ProvenanceDatabase:
     def getEventExecWindow(self, event_id : str):
         ew = self.exec_windows
         ewe = self.exec_window_events
-        return self(Query.from_(ew).select(ewe.star).where(ew.event_id == event_id )
-            .inner_join(ewe).on( ew.exec_window_entry_id == ewe.event_id ) )
+        func = self.functions
+        return self(Query.from_(ew).select(ewe.star, func.name  ) \
+                    .where(ew.event_id == event_id ) \
+                    .inner_join(ewe).on( ew.exec_window_entry_id == ewe.event_id ) \
+                    .inner_join(func).on( func.fid == ewe.fid ) )
 
     def getEventCallStack(self, event_id : str):
         cs = self.call_stacks
@@ -136,9 +140,48 @@ class ProvenanceDatabase:
                 ulabels[l] += 1
         return ulabels
     
+    #Return the function profile information
+    def getFunctionProfile(self, fid, excl_or_incl):
+        if excl_or_incl == 'exclusive':
+            exc = self.func_runtime_profile_exclusive_stats
+            return self( Query.from_(exc).select(exc.star).where(exc.fid == fid) )
+        elif excl_or_incl == 'inclusive':
+            inc = self.func_runtime_profile_inclusive_stats
+            return self( Query.from_(inc).select(inc.star).where(inc.fid == fid) )
+        else:
+            raise Exception("Invalid profile type")        
 
+
+    #Get an application profile. If "exclusive" it will also show the accumulated severity and anomaly time fraction
+    def getApplicationProfile(self, excl_or_incl):
+        if excl_or_incl == 'exclusive':
+            exc = self.func_runtime_profile_exclusive_stats
+            fname = self.functions
+            sev = self.func_anomaly_severity_stats
+            return self( Query.from_(exc).select( \
+                                          exc.accumulate.as_("runtime"), sev.accumulate.as_("accum_sev"), exc.fid, \
+                                          fn.Cast( (sev.accumulate / exc.accumulate), 'DECIMAL(5, 4)' ).as_("anom_time_frac"), \
+                                          fname.name, 
+                                         )\
+                 .inner_join(fname).on(fname.fid == exc.fid)\
+                 .inner_join(sev).on(sev.fid == exc.fid)\
+                 .orderby(exc.accumulate, order=Order.desc) )
+        elif excl_or_incl == 'inclusive':
+            exc = self.func_runtime_profile_inclusive_stats
+            fname = self.functions
+            return self( Query.from_(exc).select( \
+                                          exc.accumulate.as_("runtime_incl"), exc.fid, \
+                                          fname.name, 
+                                         )\
+                 .inner_join(fname).on(fname.fid == exc.fid)\
+                 .orderby(exc.accumulate, order=Order.desc) )
+        else:
+            raise Exception("Invalid profile type")      
     
-    #Tabulate summary information on functions, sorted in descending order by accumulated severity (order_by="anom_severity") or anomaly count (order_by="anom_count")
+    #Tabulate summary information on functions, sorted in descending order by:
+    #  accumulated severity (order_by="anom_severity")
+    #  anomaly count (order_by="anom_count")
+    #  exclusive total runtime (order_by="total_time_excl")
     def topFunctions(self, order_by = 'anom_severity'):
         sev = self.func_anomaly_severity_stats
         func = self.functions
@@ -150,10 +193,18 @@ class ProvenanceDatabase:
             ob = sev.accumulate
         elif order_by == 'anom_count':
             ob = acnt.accumulate
+        elif order_by == 'total_time_excl':
+            ob = ecnt.accumulate
         else:
             raise Exception("Unsupported sort order")
                     
-        return self(Query.from_(sev).select(sev.accumulate.as_("accum_sev"), sev.fid, func.pid, acnt.accumulate.as_("anomalies"), ecnt.count.as_("calls"), func.name )
+        return self(Query.from_(sev).select(sev.accumulate.as_("accum_sev"), \
+                                            ecnt.accumulate.as_("total_time_excl"), \
+                                            sev.fid, func.pid, \
+                                            acnt.accumulate.as_("anomalies"), ecnt.count.as_("calls"), \
+                                            fn.Cast( (acnt.accumulate / ecnt.count), 'DECIMAL(5, 4)' ).as_("anom_call_frac"), \
+                                            fn.Cast( (sev.accumulate / ecnt.accumulate), 'DECIMAL(5, 4)' ).as_("anom_time_frac"), \
+                                            func.name )
             .inner_join(func).on(func.fid == sev.fid)
             .inner_join(acnt).on(func.fid == acnt.fid)
             .inner_join(ecnt).on(func.fid == ecnt.fid)
@@ -176,6 +227,22 @@ class ProvenanceDatabase:
         io_steps_tab = self.io_steps.get_sql()
         
         return self("FROM %s SELECT *, (%s - (FROM %s SELECT FIRST(io_step_tstart) WHERE pid = %s.pid AND rid = %s.rid AND io_step = 0))/1e6 AS %s" % (tab_nm,col_name_in,io_steps_tab,tab_nm,tab_nm, col_name_out ) )
+
+    #List the anomalies/normal_execs for a particular function, with extra columns containing the entry and exit time in seconds since the rank's job started    
+    def getFunctionEvents(self, fid, etype):
+        tab = None
+        if etype == "anomalies":
+            tab = self.anomalies
+        elif etype == "normal_execs":
+            tab = self.normal_execs
+        else:
+            raise Exception("Invalid event type")
+        
+        ios = self.io_steps
+        self( Query.from_(tab).select(tab.star).where(tab.fid == fid).orderby(tab.exit, order=Order.desc) ).to_view("_getEvents_r1")
+        self.convertColumnToSecondsSinceStart("_getEvents_r1", "entry", "entry_s").to_view("_getEvents_r2")
+        return self.convertColumnToSecondsSinceStart("_getEvents_r2", "exit", "exit_s")
+
     
     #Return the primary table (anomalies / normal_execs) for the specific event
     def getEventPrimaryTable(self, event_id):
@@ -208,8 +275,37 @@ class ProvenanceDatabase:
         
         start = self.getRunStartTime(rid,pid)
         s = self(Query.from_(rt).select( ( (rt.entry - start)/1e6 ).as_("entry_s") , ( (rt.exit - start)/1e6 ).as_("exit_s"),  ( (rt.timestamp - start)/1e6 ).as_("state_timestamp_s"), rt.star    )).to_view("s")
-        return self('SELECT "pid", "rid", "hostname", "state_timestamp_s", "entry_s", "exit_s", "meminfo:MemFree (MB)" AS "free_MB",  "meminfo:MemTotal (MB)" AS "total_MB", "Memory Footprint (VmRSS) (KB)" AS "RSS_KB", "Heap Memory Used (KB)" AS "heap_memory_used_KB" FROM "s"')
+        return self('SELECT "pid", "rid", "hostname", "state_timestamp_s", "entry_s", "exit_s", \
+"meminfo:MemFree (MB)" AS "free_MB", \
+"meminfo:MemTotal (MB)" AS "total_MB", \
+"Memory Footprint (VmRSS) (KB)" AS "RSS_KB", \
+"Heap Memory Used (KB)" AS "heap_memory_used_KB", \
+FROM "s"')
 
+    #Return the node memory status recorded at a timestamp as close as possible to the function execution timestamp
+    def getEventNodeCPUstatus(self, event_id):
+        prim=self.getEventPrimaryTable(event_id)
+        ns=self.node_state
+        nn=self.rank_node_map
+        r = self(Query.from_(prim).select(prim.entry,prim.exit,prim.pid,prim.rid,ns.star,nn.hostname)
+                 .inner_join(ns).on(ns.event_id == prim.event_id).where(prim.event_id == event_id)
+                 .inner_join(nn).on( (nn.pid == prim.pid) & (nn.rid == prim.rid) )
+                 ).to_view("r")
+
+        #Convert the times into seconds since start
+        rt = Table("r")
+        rid = r.fetchnumpy()['rid'][0]
+        pid = r.fetchnumpy()['pid'][0]
+        
+        start = self.getRunStartTime(rid,pid)
+        s = self(Query.from_(rt).select( ( (rt.entry - start)/1e6 ).as_("entry_s") , ( (rt.exit - start)/1e6 ).as_("exit_s"),  ( (rt.timestamp - start)/1e6 ).as_("state_timestamp_s"), rt.star    )).to_view("s")
+        return self('SELECT "pid", "rid", "hostname", "state_timestamp_s", "entry_s", "exit_s", \
+"cpu: User %" AS "cpu_user_%", \
+"cpu: Nice %" AS "cpu_nice_%", \
+"cpu: System %" AS "cpu_system_%", \
+"cpu: Idle %" AS "cpu_idle_%", \
+FROM "s"')
+    
     #Produce a table for a specific process pid containing:
     #- the call stack label
     #- a count of anomalies with that call stack
